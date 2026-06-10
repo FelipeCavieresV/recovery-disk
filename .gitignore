@@ -67,3 +67,19 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Qt generated
+*_autogen/
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# Windows
+Thumbs.db
+Desktop.ini
