@@ -51,6 +51,17 @@
 #include <functional>
 #include <QMap>
 #include <QSet>
+#include <QListWidget>
+#include <QListWidgetItem>
+#include <QListView>
+#include <QIcon>
+#include <QPainter>
+#include <QImageReader>
+#include <QPainter>
+#include <QPolygon>
+#include <QScrollBar>
+#include <QFileInfo>
+
 
 namespace
 {
@@ -522,6 +533,12 @@ QWidget* MainWindow::createResultsPage()
     deepScanButton = new QPushButton("Escaneo profundo");
     cancelScanButton = new QPushButton("Cancelar");
 
+    viewModeCombo = new QComboBox(this);
+    viewModeCombo->addItem("Lista");
+    viewModeCombo->addItem("Miniaturas");
+    viewModeCombo->setMinimumWidth(140);
+    viewModeCombo->setMinimumHeight(36);
+
     searchInput = new QLineEdit();
     searchInput->setPlaceholderText("Buscar por nombre o extensión...");
     searchInput->setMinimumHeight(36);
@@ -531,6 +548,7 @@ QWidget* MainWindow::createResultsPage()
     toolbarLayout->addWidget(deepScanButton);
     toolbarLayout->addWidget(cancelScanButton);
     toolbarLayout->addStretch();
+    toolbarLayout->addWidget(viewModeCombo);
     toolbarLayout->addWidget(searchInput, 1);
 
     root->addWidget(toolbar);
@@ -611,6 +629,8 @@ QWidget* MainWindow::createResultsPage()
     tableTopLayout->addWidget(selectAllButton);
     tableTopLayout->addWidget(recoverButton);
 
+    resultsViews = new QStackedWidget(this);
+
     table = new QTableWidget();
 
     table->setColumnCount(8);
@@ -651,6 +671,31 @@ QWidget* MainWindow::createResultsPage()
     table->setSelectionMode(QAbstractItemView::SingleSelection);
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
 
+    gallery = new QListWidget(this);
+
+    gallery->setViewMode(QListView::IconMode);
+    gallery->setResizeMode(QListView::Adjust);
+    gallery->setMovement(QListView::Static);
+    gallery->setSpacing(16);
+    gallery->setWordWrap(true);
+    gallery->setIconSize(QSize(96, 96));
+    gallery->setGridSize(QSize(130, 145));
+    gallery->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    gallery->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    gallery->setUniformItemSizes(false);
+    gallery->setWrapping(true);
+    gallery->setFlow(QListView::LeftToRight);
+    gallery->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    gallery->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+
+    resultsViews->addWidget(table);
+    resultsViews->addWidget(gallery);
+
+    tableLayout->addLayout(tableTopLayout);
+    tableLayout->addWidget(resultsViews, 1);
+
+    setupThumbnailLoader();
+
     connect(
         table->verticalScrollBar(),
         &QScrollBar::valueChanged,
@@ -659,18 +704,27 @@ QWidget* MainWindow::createResultsPage()
         {
             QScrollBar* bar = table->verticalScrollBar();
 
-            if (!bar) {
+            if (!bar)
+            {
                 return;
             }
 
-            if (value >= bar->maximum() - 20) {
+            if (value >= bar->maximum() - 20)
+            {
                 loadMoreVisibleRows();
             }
         }
     );
 
-    tableLayout->addLayout(tableTopLayout);
-    tableLayout->addWidget(table, 1);
+    connect(
+        gallery->verticalScrollBar(),
+        &QScrollBar::valueChanged,
+        this,
+        [this]()
+        {
+            requestVisibleThumbnails();
+        }
+    );
 
     QFrame* previewPanel = new QFrame(this);
     previewPanel->setObjectName("ContentPanel");
@@ -688,6 +742,11 @@ QWidget* MainWindow::createResultsPage()
     previewLabel->setMinimumHeight(180);
     previewLabel->setWordWrap(true);
     previewLabel->setObjectName("PreviewBox");
+
+    previewStatusLabel = new QLabel();
+    previewStatusLabel->setWordWrap(true);
+    previewStatusLabel->setAlignment(Qt::AlignCenter);
+    previewStatusLabel->setStyleSheet("color:#667085;");
 
     videoWidget = new QVideoWidget(this);
     videoWidget->setMinimumHeight(180);
@@ -716,21 +775,7 @@ QWidget* MainWindow::createResultsPage()
 
     previewLayout->addWidget(previewTitle);
     previewLayout->addWidget(previewLabel);
-    previewStatusLabel = new QLabel();
-
-    previewStatusLabel->setWordWrap(true);
-
-    previewStatusLabel->setAlignment(
-        Qt::AlignCenter
-    );
-
-    previewStatusLabel->setStyleSheet(
-        "color:#667085;"
-    );
-
-    previewLayout->addWidget(
-        previewStatusLabel
-    );
+    previewLayout->addWidget(previewStatusLabel);
     previewLayout->addWidget(videoWidget);
     previewLayout->addWidget(previewNameLabel);
     previewLayout->addWidget(previewTypeLabel);
@@ -748,8 +793,9 @@ QWidget* MainWindow::createResultsPage()
 
     splitter->setStretchFactor(0, 1);
     splitter->setStretchFactor(1, 4);
-    splitter->setStretchFactor(2, 1);
-    splitter->setSizes({230, 620, 280});
+    splitter->setStretchFactor(2, 2);
+
+    splitter->setSizes({ 240, 760, 320 });
 
     root->addWidget(splitter, 1);
 
@@ -761,6 +807,24 @@ QWidget* MainWindow::createResultsPage()
     connect(selectAllButton, &QPushButton::clicked, this, &MainWindow::toggleSelectAll);
     connect(searchInput, &QLineEdit::textChanged, this, &MainWindow::applyFilters);
 
+    connect(
+        viewModeCombo,
+        &QComboBox::currentIndexChanged,
+        this,
+        [this](int index)
+        {
+            resultsViews->setCurrentIndex(index);
+
+            if (index == 1)
+            {
+                QTimer::singleShot(
+                    100,
+                    this,
+                    &MainWindow::requestVisibleThumbnails
+                );
+            }
+        }
+    );
     connect(
         table,
         &QTableWidget::cellClicked,
@@ -774,6 +838,33 @@ QWidget* MainWindow::createResultsPage()
     connect(
         table,
         &QTableWidget::itemChanged,
+        this,
+        [this]()
+        {
+            updateSelectedCount();
+        }
+    );
+
+    connect(
+        gallery,
+        &QListWidget::itemClicked,
+        this,
+        [this](QListWidgetItem* item)
+        {
+            if (!item)
+            {
+                return;
+            }
+
+            const int fileIndex = item->data(Qt::UserRole).toInt();
+
+            showPreviewByFileIndex(fileIndex);
+        }
+    );
+
+    connect(
+        gallery,
+        &QListWidget::itemChanged,
         this,
         [this]()
         {
@@ -803,6 +894,15 @@ QWidget* MainWindow::createResultsPage()
         }
 
         QLineEdit {
+            background-color: white;
+            color: #101828;
+            border: 1px solid #D0D5DD;
+            border-radius: 8px;
+            padding: 7px 10px;
+            font-size: 14px;
+        }
+
+        QComboBox {
             background-color: white;
             color: #101828;
             border: 1px solid #D0D5DD;
@@ -848,6 +948,29 @@ QWidget* MainWindow::createResultsPage()
             font-weight: 700;
         }
 
+        QListWidget {
+            background-color: white;
+            color: #101828;
+            border: none;
+            font-size: 13px;
+            selection-background-color: #D1E9FF;
+            selection-color: #101828;
+        }
+
+        QListWidget::item {
+            border-radius: 10px;
+            padding: 6px;
+        }
+
+        QListWidget::item:hover {
+            background-color: #F2F4F7;
+        }
+
+        QListWidget::item:selected {
+            background-color: #D1E9FF;
+            color: #101828;
+        }
+
         QTreeWidget {
             background-color: white;
             color: #101828;
@@ -881,6 +1004,12 @@ QWidget* MainWindow::createResultsPage()
             border: 1px dashed #D0D5DD;
             border-radius: 12px;
             color: #667085;
+        }
+
+        QVideoWidget#PreviewBox {
+            background-color: #000000;
+            border: 1px dashed #D0D5DD;
+            border-radius: 12px;
         }
     )");
 
@@ -1106,6 +1235,460 @@ QString MainWindow::categoryKeyForFile(const RecoverableFile& file) const
     }
 
     return "others";
+}
+
+QIcon MainWindow::iconForRecoverableFile(
+    const RecoverableFile& file
+) const
+{
+    static QHash<QString, QIcon> iconCache;
+
+    QString ext = file.extension.toUpper();
+
+    if (ext.startsWith("."))
+    {
+        ext.remove(0, 1);
+    }
+
+    if (ext.isEmpty())
+    {
+        ext = "FILE";
+    }
+
+    if (ext.length() > 4)
+    {
+        ext = ext.left(4);
+    }
+
+    if (iconCache.contains(ext))
+    {
+        return iconCache.value(ext);
+    }
+
+    QPixmap iconPixmap(96, 96);
+    iconPixmap.fill(Qt::transparent);
+
+    QPainter painter(&iconPixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+
+    painter.setBrush(QColor("#F2F4F7"));
+    painter.setPen(QColor("#D0D5DD"));
+    painter.drawRoundedRect(8, 8, 80, 80, 12, 12);
+
+    painter.setPen(QColor("#101828"));
+
+    QFont font = painter.font();
+    font.setBold(true);
+    font.setPointSize(13);
+    painter.setFont(font);
+
+    painter.drawText(
+        QRect(8, 8, 80, 80),
+        Qt::AlignCenter,
+        ext
+    );
+
+    painter.end();
+
+    QIcon icon(iconPixmap);
+    iconCache.insert(ext, icon);
+
+    return icon;
+}
+
+void MainWindow::appendFileToGallery(
+    const RecoverableFile& file,
+    int fileIndex
+)
+{
+    if (!gallery)
+    {
+        return;
+    }
+
+    QListWidgetItem* item = new QListWidgetItem();
+
+    item->setText(file.originalName);
+    item->setIcon(placeholderIconForFile(file));
+    item->setData(Qt::UserRole, fileIndex);
+    item->setToolTip(file.originalPath);
+
+    item->setFlags(
+        Qt::ItemIsEnabled |
+        Qt::ItemIsSelectable |
+        Qt::ItemIsUserCheckable
+    );
+
+    item->setCheckState(Qt::Unchecked);
+
+    gallery->addItem(item);
+}
+
+void MainWindow::setupThumbnailLoader()
+{
+    thumbnailTimer = new QTimer(this);
+    thumbnailTimer->setInterval(30);
+
+    connect(
+        thumbnailTimer,
+        &QTimer::timeout,
+        this,
+        &MainWindow::loadNextThumbnailBatch
+    );
+}
+
+void MainWindow::requestVisibleThumbnails()
+{
+    if (!gallery || !thumbnailTimer)
+    {
+        return;
+    }
+
+    if (viewModeCombo && viewModeCombo->currentIndex() != 1)
+    {
+        return;
+    }
+
+    const QRect viewportRect = gallery->viewport()->rect();
+
+    for (int i = 0; i < gallery->count(); ++i)
+    {
+        QListWidgetItem* item = gallery->item(i);
+
+        if (!item)
+        {
+            continue;
+        }
+
+        QRect itemRect = gallery->visualItemRect(item);
+
+        if (!itemRect.intersects(viewportRect))
+        {
+            continue;
+        }
+
+        const int fileIndex = item->data(Qt::UserRole).toInt();
+
+        if (fileIndex < 0 || fileIndex >= files.size())
+        {
+            continue;
+        }
+
+        thumbnailPendingIndexes.insert(fileIndex);
+    }
+
+    if (!thumbnailTimer->isActive())
+    {
+        thumbnailTimer->start();
+    }
+}
+
+void MainWindow::loadNextThumbnailBatch()
+{
+    if (!gallery)
+    {
+        return;
+    }
+
+    if (thumbnailPendingIndexes.isEmpty())
+    {
+        thumbnailTimer->stop();
+        return;
+    }
+
+    const int maxPerBatch = 8;
+    int processed = 0;
+
+    QList<int> indexes = thumbnailPendingIndexes.values();
+
+    for (int fileIndex : indexes)
+    {
+        if (processed >= maxPerBatch)
+        {
+            break;
+        }
+
+        thumbnailPendingIndexes.remove(fileIndex);
+
+        if (fileIndex < 0 || fileIndex >= files.size())
+        {
+            continue;
+        }
+
+        QIcon icon = realThumbnailForFile(files[fileIndex]);
+
+        for (int i = 0; i < gallery->count(); ++i)
+        {
+            QListWidgetItem* item = gallery->item(i);
+
+            if (!item)
+            {
+                continue;
+            }
+
+            if (item->data(Qt::UserRole).toInt() == fileIndex)
+            {
+                item->setIcon(icon);
+                break;
+            }
+        }
+
+        ++processed;
+    }
+}
+
+QIcon MainWindow::placeholderIconForFile(
+    const RecoverableFile& file
+) const
+{
+    QString ext = file.extension.toUpper();
+
+    if (ext.startsWith("."))
+    {
+        ext.remove(0, 1);
+    }
+
+    if (ext.isEmpty())
+    {
+        ext = "FILE";
+    }
+
+    if (ext.length() > 4)
+    {
+        ext = ext.left(4);
+    }
+
+    QPixmap iconPixmap(96, 96);
+    iconPixmap.fill(Qt::transparent);
+
+    QPainter painter(&iconPixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+
+    painter.setBrush(QColor("#F2F4F7"));
+    painter.setPen(QColor("#D0D5DD"));
+    painter.drawRoundedRect(8, 8, 80, 80, 12, 12);
+
+    painter.setPen(QColor("#101828"));
+
+    QFont font = painter.font();
+    font.setBold(true);
+    font.setPointSize(13);
+    painter.setFont(font);
+
+    painter.drawText(
+        QRect(8, 8, 80, 80),
+        Qt::AlignCenter,
+        ext
+    );
+
+    painter.end();
+
+    return QIcon(iconPixmap);
+}
+
+QIcon MainWindow::realThumbnailForFile(
+    RecoverableFile& file
+)
+{
+    PreviewService preview;
+
+    QString path = file.currentPath;
+
+    if (path.isEmpty() || !QFileInfo::exists(path))
+    {
+        if (file.source == RecoverySource::DeepScan)
+        {
+            path = preview.createTemporaryPreviewFile(
+                file,
+                activeScanRoot
+            );
+
+            if (!path.isEmpty())
+            {
+                file.currentPath = path;
+            }
+        }
+        else
+        {
+            path = file.originalPath;
+        }
+    }
+
+    if (path.isEmpty() || !QFileInfo::exists(path))
+    {
+        return placeholderIconForFile(file);
+    }
+
+    if (thumbnailCache.contains(path))
+    {
+        return thumbnailCache.value(path);
+    }
+
+    if (preview.isImage(file.extension))
+    {
+        QImageReader reader(path);
+        reader.setAutoTransform(true);
+        reader.setScaledSize(QSize(96, 96));
+
+        QImage image = reader.read();
+
+        if (!image.isNull())
+        {
+            QPixmap pixmap = QPixmap::fromImage(image);
+
+            QIcon icon(pixmap);
+            thumbnailCache.insert(path, icon);
+
+            return icon;
+        }
+    }
+
+    if (preview.isVideo(file.extension))
+    {
+        QPixmap videoPixmap(96, 96);
+        videoPixmap.fill(Qt::transparent);
+
+        QPainter painter(&videoPixmap);
+        painter.setRenderHint(QPainter::Antialiasing);
+
+        painter.setBrush(QColor("#111827"));
+        painter.setPen(Qt::NoPen);
+        painter.drawRoundedRect(8, 8, 80, 80, 12, 12);
+
+        painter.setBrush(Qt::white);
+
+        QPolygon playIcon;
+        playIcon << QPoint(40, 30)
+                 << QPoint(40, 66)
+                 << QPoint(68, 48);
+
+        painter.drawPolygon(playIcon);
+        painter.end();
+
+        QIcon icon(videoPixmap);
+        thumbnailCache.insert(path, icon);
+
+        return icon;
+    }
+
+    return placeholderIconForFile(file);
+}
+
+void MainWindow::showPreviewByFileIndex(int fileIndex)
+{
+    if (fileIndex < 0 || fileIndex >= files.size())
+        return;
+
+    for (int row = 0; row < table->rowCount(); ++row)
+    {
+        QTableWidgetItem* item = table->item(row, 1);
+
+        if (!item)
+            continue;
+
+        if (item->data(Qt::UserRole).toInt() == fileIndex)
+        {
+            table->selectRow(row);
+            showPreview(row);
+            return;
+        }
+    }
+
+    currentPreviewFileIndex = fileIndex;
+
+    RecoverableFile& file = files[fileIndex];
+
+    PreviewService preview;
+
+    if (mediaPlayer)
+        mediaPlayer->stop();
+
+    if (videoWidget)
+        videoWidget->hide();
+
+    previewLabel->show();
+    previewLabel->setAlignment(Qt::AlignCenter);
+
+    QString previewPath = file.currentPath;
+
+    if (previewPath.isEmpty() || !QFileInfo::exists(previewPath))
+    {
+        if (file.source == RecoverySource::DeepScan)
+        {
+            previewPath =
+                preview.createTemporaryPreviewFile(
+                    file,
+                    activeScanRoot
+                );
+
+            if (!previewPath.isEmpty())
+                file.currentPath = previewPath;
+        }
+        else
+        {
+            previewPath = file.originalPath;
+        }
+    }
+
+    if (previewPath.isEmpty() || !QFileInfo::exists(previewPath))
+    {
+        restoreLastPreviewImage();
+        updatePreviewDetails(file);
+        return;
+    }
+
+    if (preview.isImage(file.extension))
+    {
+        QPixmap pixmap =
+            preview.createImagePreview(
+                previewPath,
+                previewLabel->size()
+            );
+
+        if (!pixmap.isNull())
+        {
+            lastPreviewPixmap = pixmap;
+            lastPreviewPath = previewPath;
+            hasPersistentPreview = true;
+
+            previewLabel->clear();
+            previewLabel->setPixmap(
+                lastPreviewPixmap.scaled(
+                    previewLabel->size(),
+                    Qt::KeepAspectRatio,
+                    Qt::SmoothTransformation
+                )
+            );
+        }
+
+        updatePreviewDetails(file);
+        return;
+    }
+
+    if (preview.isVideo(file.extension))
+    {
+        hasPersistentPreview = false;
+
+        previewLabel->hide();
+
+        if (videoWidget)
+            videoWidget->show();
+
+        if (mediaPlayer)
+        {
+            mediaPlayer->setSource(
+                QUrl::fromLocalFile(previewPath)
+            );
+
+            mediaPlayer->play();
+        }
+
+        updatePreviewDetails(file);
+        return;
+    }
+
+    restoreLastPreviewImage();
+    updatePreviewDetails(file);
 }
 
 void MainWindow::updateResultsTreeCounts()
@@ -1755,14 +2338,20 @@ void MainWindow::appendFilesToTable(
 
 void MainWindow::applyFilters()
 {
-    if (!table) {
+    if (!table)
         return;
-    }
 
     table->blockSignals(true);
     table->setUpdatesEnabled(false);
     table->setSortingEnabled(false);
     table->setRowCount(0);
+
+    if (gallery)
+    {
+        gallery->blockSignals(true);
+        gallery->setUpdatesEnabled(false);
+        gallery->clear();
+    }
 
     visibleFileIndexes.clear();
     loadedVisibleRows = 0;
@@ -1779,6 +2368,12 @@ void MainWindow::applyFilters()
 
     table->setUpdatesEnabled(true);
     table->blockSignals(false);
+
+    if (gallery)
+    {
+        gallery->setUpdatesEnabled(true);
+        gallery->blockSignals(false);
+    }
 
     loadMoreVisibleRows();
 
@@ -2102,6 +2697,7 @@ void MainWindow::openCurrentTempFolder()
 QVector<RecoverableFile> MainWindow::selectedFiles() const
 {
     QVector<RecoverableFile> selected;
+    QSet<int> selectedIndexes;
 
     for (int row = 0; row < table->rowCount(); ++row)
     {
@@ -2115,10 +2711,31 @@ QVector<RecoverableFile> MainWindow::selectedFiles() const
         if (!item)
             continue;
 
-        int fileIndex = item->data(Qt::UserRole).toInt();
+        const int fileIndex = item->data(Qt::UserRole).toInt();
 
         if (fileIndex >= 0 && fileIndex < files.size())
-            selected.push_back(files[fileIndex]);
+            selectedIndexes.insert(fileIndex);
+    }
+
+    if (gallery)
+    {
+        for (int i = 0; i < gallery->count(); ++i)
+        {
+            QListWidgetItem* item = gallery->item(i);
+
+            if (!item || item->checkState() != Qt::Checked)
+                continue;
+
+            const int fileIndex = item->data(Qt::UserRole).toInt();
+
+            if (fileIndex >= 0 && fileIndex < files.size())
+                selectedIndexes.insert(fileIndex);
+        }
+    }
+
+    for (int fileIndex : selectedIndexes)
+    {
+        selected.push_back(files[fileIndex]);
     }
 
     return selected;
@@ -2218,7 +2835,10 @@ void MainWindow::flushPendingScanFiles()
                 visibleFileIndexes.append(fileIndex);
 
                 if (table->rowCount() < maxVisibleDuringScan)
+                {
                     appendFileToTable(file, fileIndex);
+                    appendFileToGallery(file, fileIndex);
+                }
             }
         }
 
@@ -2330,6 +2950,12 @@ void MainWindow::loadMoreVisibleRows()
     table->setUpdatesEnabled(false);
     table->blockSignals(true);
 
+    if (gallery)
+    {
+        gallery->setUpdatesEnabled(false);
+        gallery->blockSignals(true);
+    }
+
     while (
         loadedVisibleRows < visibleFileIndexes.size() &&
         loaded < maxRowsToLoad
@@ -2344,6 +2970,11 @@ void MainWindow::loadMoreVisibleRows()
                 files[fileIndex],
                 fileIndex
             );
+
+            appendFileToGallery(
+                files[fileIndex],
+                fileIndex
+            );
         }
 
         ++loadedVisibleRows;
@@ -2352,6 +2983,12 @@ void MainWindow::loadMoreVisibleRows()
 
     table->blockSignals(false);
     table->setUpdatesEnabled(true);
+
+    if (gallery)
+    {
+        gallery->blockSignals(false);
+        gallery->setUpdatesEnabled(true);
+    }
 
     resultCountLabel->setText(
         QString("Resultados visibles: %1 / cargados: %2")

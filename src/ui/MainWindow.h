@@ -6,6 +6,7 @@
 
 #include <QTableWidget>
 #include <QTreeWidget>
+#include <QListWidget>
 #include <QPushButton>
 #include <QLabel>
 #include <QComboBox>
@@ -17,6 +18,7 @@
 #include <QTimer>
 #include <QThread>
 #include <QPixmap>
+#include <QIcon>
 
 #include <QMediaPlayer>
 #include <QVideoWidget>
@@ -55,7 +57,27 @@ private:
 
     QTreeWidget* resultsTree = nullptr;
     QLineEdit* searchInput = nullptr;
+    QTimer* thumbnailTimer = nullptr;
+
+    QHash<QString, QIcon> thumbnailCache;
+    QSet<int> thumbnailPendingIndexes;
+
+    void setupThumbnailLoader();
+    void requestVisibleThumbnails();
+    void loadNextThumbnailBatch();
+    QIcon placeholderIconForFile(const RecoverableFile& file) const;
+    QIcon realThumbnailForFile(RecoverableFile& file);
+    /*
+     * Vista de resultados:
+     * - resultsViews permite cambiar entre lista y miniaturas.
+     * - table mantiene tu implementación actual.
+     * - gallery muestra los archivos como Windows, con miniaturas.
+     */
+    QStackedWidget* resultsViews = nullptr;
+    QComboBox* viewModeCombo = nullptr;
+
     QTableWidget* table = nullptr;
+    QListWidget* gallery = nullptr;
 
     QLabel* previewLabel = nullptr;
     QLabel* previewStatusLabel = nullptr;
@@ -161,6 +183,20 @@ private:
         const QVector<RecoverableFile>& newFiles
     );
 
+    /*
+     * Nuevas funciones para vista de miniaturas.
+     */
+    void appendFileToGallery(
+        const RecoverableFile& file,
+        int fileIndex
+    );
+
+    QIcon iconForRecoverableFile(
+        const RecoverableFile& file
+    ) const;
+
+    void fillGallery();
+
     void flushPendingScanFiles();
 
     void loadMoreVisibleRows();
@@ -176,6 +212,8 @@ private:
     void toggleSelectAll();
 
     void showPreview(int row);
+    void showPreviewByFileIndex(int fileIndex);
+
     void clearPreviewDetails();
 
     void updatePreviewDetails(
