@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 
+#include "ui/FileTypeDialog.h"
 #include "app/ScanWorker.h"
 #include "services/RecycleBinScanner.h"
 #include <QFileInfo>
@@ -12,11 +13,16 @@
 #include <QUrl>
 #include "app/ScanWorker.h"
 #include "services/RecycleBinScanner.h"
+#include "services/DriveScanner.h"
 #include "services/FolderScanner.h"
 #include "services/FileRecoveryService.h"
 #include "services/FileTypeHelper.h"
 #include "services/FileGroupingHelper.h"
 #include "preview/PreviewService.h"
+#include "preview/VideoThumbnailer.h"
+#include <QtConcurrent>
+#include <QFutureWatcher>
+#include <QImageReader>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QGridLayout>
@@ -220,7 +226,7 @@ MainWindow::~MainWindow()
 
 void MainWindow::setupUi()
 {
-    setWindowTitle("RecoveryDisk - Recuperación de archivos");
+    setWindowTitle("DemogoRecovery - Recuperación de archivos");
     resize(1320, 780);
 
     QWidget* central = new QWidget(this);
@@ -286,7 +292,7 @@ QWidget* MainWindow::createSidebar()
     layout->setContentsMargins(18, 22, 18, 18);
     layout->setSpacing(12);
 
-    QLabel* logo = new QLabel("RecoveryDisk");
+    QLabel* logo = new QLabel("DemogoRecovery");
     logo->setObjectName("LogoLabel");
 
     QLabel* subtitle = new QLabel("Data Recovery");
@@ -393,10 +399,32 @@ QWidget* MainWindow::createHomePage()
 
     driveCombo = new QComboBox(this);
     driveCombo->setMinimumHeight(38);
-    driveCombo->setMinimumWidth(180);
+    driveCombo->setMinimumWidth(220);
+
+    QPushButton* refreshDrivesButton = new QPushButton("↻ Actualizar");
+    refreshDrivesButton->setMinimumHeight(38);
+    refreshDrivesButton->setCursor(Qt::PointingHandCursor);
+    refreshDrivesButton->setToolTip("Actualizar lista de unidades (útil al conectar un USB)");
+    refreshDrivesButton->setStyleSheet(R"(
+        QPushButton {
+            background-color: #F2F4F7;
+            color: #344054;
+            border: 1px solid #D0D5DD;
+            border-radius: 8px;
+            padding: 6px 14px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        QPushButton:hover {
+            background-color: #E4E7EC;
+        }
+    )");
+
+    connect(refreshDrivesButton, &QPushButton::clicked, this, &MainWindow::loadDrives);
 
     driveLayout->addWidget(driveLabel);
     driveLayout->addWidget(driveCombo);
+    driveLayout->addWidget(refreshDrivesButton);
     driveLayout->addStretch();
 
     mainLayout->addWidget(drivePanel);
@@ -1041,48 +1069,9 @@ void MainWindow::updateResultsTree()
         return;
     }
 
+    const QString previousScope = currentTreeScope;
     const QString previousCategory = currentTreeCategoryKey;
     const QString previousExtension = currentTreeExtension;
-
-    struct CategoryBucket
-    {
-        QString key;
-        QString label;
-        int count = 0;
-        QMap<QString, int> extensionCounts;
-    };
-
-    QVector<CategoryBucket> buckets =
-    {
-        {"images", "Imágenes", 0, {}},
-        {"videos", "Videos", 0, {}},
-        {"documents", "Documentos", 0, {}},
-        {"audio", "Audio", 0, {}},
-        {"compressed", "Comprimidos", 0, {}},
-        {"others", "Otros", 0, {}}
-    };
-
-    QMap<QString, int> bucketIndex;
-
-    for (int i = 0; i < buckets.size(); ++i) {
-        bucketIndex.insert(buckets[i].key, i);
-    }
-
-    for (const RecoverableFile& file : files) {
-        const QString key = categoryKeyForFile(file);
-        const QString ext = extensionForFile(file);
-
-        const int index = bucketIndex.value(
-            key,
-            bucketIndex.value("others")
-        );
-
-        buckets[index].count++;
-
-        if (!ext.isEmpty()) {
-            buckets[index].extensionCounts[ext]++;
-        }
-    }
 
     resultsTree->blockSignals(true);
     resultsTree->clear();
@@ -1094,13 +1083,15 @@ void MainWindow::updateResultsTree()
             return;
         }
 
+        const QString scope =
+            item->data(0, Qt::UserRole + 2).toString();
         const QString category =
             item->data(0, Qt::UserRole).toString();
-
         const QString extension =
             item->data(0, Qt::UserRole + 1).toString();
 
         if (
+            scope == previousScope &&
             category == previousCategory &&
             extension == previousExtension
         ) {
@@ -1108,50 +1099,145 @@ void MainWindow::updateResultsTree()
         }
     };
 
+    // Construye el sub-árbol de categorías (Imágenes/Videos/...) con sus
+    // extensiones para el subconjunto de archivos que cumple 'pred'. Si parent
+    // es nullptr, las categorías se añaden como nodos de nivel superior.
+    auto buildBuckets =
+        [&](QTreeWidgetItem* parent,
+            const QString& scope,
+            std::function<bool(const RecoverableFile&)> pred) -> int
+    {
+        struct CategoryBucket
+        {
+            QString key;
+            QString label;
+            int count = 0;
+            QMap<QString, int> extensionCounts;
+        };
+
+        QVector<CategoryBucket> buckets =
+        {
+            {"images", "Imágenes", 0, {}},
+            {"videos", "Videos", 0, {}},
+            {"documents", "Documentos", 0, {}},
+            {"audio", "Audio", 0, {}},
+            {"compressed", "Comprimidos", 0, {}},
+            {"others", "Otros", 0, {}}
+        };
+
+        QMap<QString, int> bucketIndex;
+        for (int i = 0; i < buckets.size(); ++i)
+            bucketIndex.insert(buckets[i].key, i);
+
+        int total = 0;
+
+        for (const RecoverableFile& file : files) {
+            if (!pred(file))
+                continue;
+
+            const QString key = categoryKeyForFile(file);
+            const QString ext = extensionForFile(file);
+
+            const int index =
+                bucketIndex.value(key, bucketIndex.value("others"));
+
+            buckets[index].count++;
+            ++total;
+
+            if (!ext.isEmpty())
+                buckets[index].extensionCounts[ext]++;
+        }
+
+        for (const CategoryBucket& bucket : buckets) {
+            if (bucket.count == 0)
+                continue;
+
+            auto* categoryItem = new QTreeWidgetItem();
+            categoryItem->setText(
+                0,
+                QString("%1 (%2)").arg(bucket.label).arg(bucket.count)
+            );
+            categoryItem->setData(0, Qt::UserRole, bucket.key);
+            categoryItem->setData(0, Qt::UserRole + 1, "");
+            categoryItem->setData(0, Qt::UserRole + 2, scope);
+
+            if (parent)
+                parent->addChild(categoryItem);
+            else
+                resultsTree->addTopLevelItem(categoryItem);
+
+            selectIfMatches(categoryItem);
+
+            for (
+                auto it = bucket.extensionCounts.constBegin();
+                it != bucket.extensionCounts.constEnd();
+                ++it
+            ) {
+                auto* extensionItem = new QTreeWidgetItem();
+                extensionItem->setText(
+                    0,
+                    QString(".%1 (%2)").arg(it.key()).arg(it.value())
+                );
+                extensionItem->setData(0, Qt::UserRole, bucket.key);
+                extensionItem->setData(0, Qt::UserRole + 1, it.key());
+                extensionItem->setData(0, Qt::UserRole + 2, scope);
+
+                categoryItem->addChild(extensionItem);
+                selectIfMatches(extensionItem);
+            }
+        }
+
+        return total;
+    };
+
+    // Nodo "Todos"
     auto* allItem = new QTreeWidgetItem();
     allItem->setText(0, QString("Todos (%1)").arg(files.size()));
     allItem->setData(0, Qt::UserRole, "all");
     allItem->setData(0, Qt::UserRole + 1, "");
+    allItem->setData(0, Qt::UserRole + 2, "");
     resultsTree->addTopLevelItem(allItem);
-
     selectIfMatches(allItem);
 
-    for (const CategoryBucket& bucket : buckets) {
-        auto* categoryItem = new QTreeWidgetItem();
-        categoryItem->setText(
-            0,
-            QString("%1 (%2)")
-                .arg(bucket.label)
-                .arg(bucket.count)
+    // Contar reconstruidos / originales
+    int reconstructedCount = 0;
+    for (const RecoverableFile& file : files)
+        if (file.reconstructed)
+            ++reconstructedCount;
+
+    const int originalCount = files.size() - reconstructedCount;
+
+    // Nodo "Reconstruido" (archivos recuperados por firma / tabla del FS)
+    if (reconstructedCount > 0) {
+        auto* recRoot = new QTreeWidgetItem();
+        recRoot->setText(
+            0, QString("Reconstruido (%1)").arg(reconstructedCount)
         );
-        categoryItem->setData(0, Qt::UserRole, bucket.key);
-        categoryItem->setData(0, Qt::UserRole + 1, "");
+        recRoot->setData(0, Qt::UserRole, "all");
+        recRoot->setData(0, Qt::UserRole + 1, "");
+        recRoot->setData(0, Qt::UserRole + 2, "reconstructed");
+        resultsTree->addTopLevelItem(recRoot);
+        selectIfMatches(recRoot);
 
-        resultsTree->addTopLevelItem(categoryItem);
-        selectIfMatches(categoryItem);
+        buildBuckets(
+            recRoot,
+            "reconstructed",
+            [](const RecoverableFile& f) { return f.reconstructed; }
+        );
+    }
 
-        for (
-            auto it = bucket.extensionCounts.constBegin();
-            it != bucket.extensionCounts.constEnd();
-            ++it
-        ) {
-            auto* extensionItem = new QTreeWidgetItem();
-            extensionItem->setText(
-                0,
-                QString(".%1 (%2)")
-                    .arg(it.key())
-                    .arg(it.value())
-            );
-            extensionItem->setData(0, Qt::UserRole, bucket.key);
-            extensionItem->setData(0, Qt::UserRole + 1, it.key());
-
-            categoryItem->addChild(extensionItem);
-            selectIfMatches(extensionItem);
-        }
+    // Archivos originales (papelera / carpeta): categorías de nivel superior
+    if (originalCount > 0) {
+        buildBuckets(
+            nullptr,
+            "original",
+            [](const RecoverableFile& f) { return !f.reconstructed; }
+        );
     }
 
     if (!itemToSelect) {
         itemToSelect = allItem;
+        currentTreeScope.clear();
         currentTreeCategoryKey = "all";
         currentTreeExtension.clear();
     }
@@ -1309,7 +1395,16 @@ void MainWindow::appendFileToGallery(
     QListWidgetItem* item = new QListWidgetItem();
 
     item->setText(file.originalName);
-    item->setIcon(placeholderIconForFile(file));
+
+    // Reaplicar la miniatura ya generada (si existe) para que persista al
+    // cambiar de categoría en el árbol; si no, mostrar el placeholder.
+    if (videoIconCache.contains(fileIndex))
+        item->setIcon(videoIconCache.value(fileIndex));
+    else if (imageIconCache.contains(fileIndex))
+        item->setIcon(imageIconCache.value(fileIndex));
+    else
+        item->setIcon(placeholderIconForFile(file));
+
     item->setData(Qt::UserRole, fileIndex);
     item->setToolTip(file.originalPath);
 
@@ -1335,6 +1430,111 @@ void MainWindow::setupThumbnailLoader()
         this,
         &MainWindow::loadNextThumbnailBatch
     );
+
+    videoThumbnailer = new VideoThumbnailer(this);
+
+    connect(
+        videoThumbnailer,
+        &VideoThumbnailer::thumbnailReady,
+        this,
+        &MainWindow::onVideoThumbnailReady
+    );
+}
+
+QIcon MainWindow::makeVideoThumbnailIcon(const QImage& frame) const
+{
+    QPixmap pixmap = QPixmap::fromImage(
+        frame.scaled(96, 96, Qt::KeepAspectRatio, Qt::SmoothTransformation)
+    );
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+
+    const int cx = pixmap.width() / 2;
+    const int cy = pixmap.height() / 2;
+
+    painter.setBrush(QColor(0, 0, 0, 120));
+    painter.setPen(Qt::NoPen);
+    painter.drawEllipse(QPoint(cx, cy), 16, 16);
+
+    painter.setBrush(Qt::white);
+    QPolygon play;
+    play << QPoint(cx - 6, cy - 9)
+         << QPoint(cx - 6, cy + 9)
+         << QPoint(cx + 10, cy);
+    painter.drawPolygon(play);
+    painter.end();
+
+    return QIcon(pixmap);
+}
+
+void MainWindow::onImageThumbnailReady(int fileIndex, const QImage& image)
+{
+    if (image.isNull())
+        return;
+
+    QIcon icon(QPixmap::fromImage(image));
+
+    // Cachear por índice para reaplicar al reconstruir la galería.
+    imageIconCache.insert(fileIndex, icon);
+
+    if (!gallery)
+        return;
+
+    for (int i = 0; i < gallery->count(); ++i)
+    {
+        QListWidgetItem* item = gallery->item(i);
+
+        if (item && item->data(Qt::UserRole).toInt() == fileIndex)
+        {
+            item->setIcon(icon);
+            break;
+        }
+    }
+}
+
+void MainWindow::onVideoThumbnailReady(int fileIndex, const QImage& image)
+{
+    if (image.isNull())
+        return;
+
+    // Guardar el fotograma completo (vista previa) y el ícono (miniatura),
+    // ambos por índice, para reaplicarlos al reconstruir la galería.
+    videoFrameCache.insert(fileIndex, image);
+
+    QIcon icon = makeVideoThumbnailIcon(image);
+    videoIconCache.insert(fileIndex, icon);
+
+    if (gallery)
+    {
+        for (int i = 0; i < gallery->count(); ++i)
+        {
+            QListWidgetItem* item = gallery->item(i);
+
+            if (item && item->data(Qt::UserRole).toInt() == fileIndex)
+            {
+                item->setIcon(icon);
+                break;
+            }
+        }
+    }
+
+    // ── Si este video es el que está en la vista previa, mostrar su fotograma ──
+    if (fileIndex == currentPreviewFileIndex && previewLabel)
+    {
+        if (videoWidget)
+            videoWidget->hide();
+
+        previewLabel->show();
+        previewLabel->clear();
+        previewLabel->setPixmap(
+            QPixmap::fromImage(image).scaled(
+                previewLabel->size(),
+                Qt::KeepAspectRatio,
+                Qt::SmoothTransformation
+            )
+        );
+    }
 }
 
 void MainWindow::requestVisibleThumbnails()
@@ -1349,32 +1549,31 @@ void MainWindow::requestVisibleThumbnails()
         return;
     }
 
-    const QRect viewportRect = gallery->viewport()->rect();
+    // Encolar los items de la galería para generar su miniatura. No dependemos
+    // del cálculo de visibilidad (poco fiable justo tras poblar la lista): se
+    // encolan hasta 'limit' items y el temporizador los procesa por lotes.
+    const int limit = 400;
+    int queued = 0;
 
-    for (int i = 0; i < gallery->count(); ++i)
+    for (int i = 0; i < gallery->count() && queued < limit; ++i)
     {
         QListWidgetItem* item = gallery->item(i);
 
         if (!item)
-        {
             continue;
-        }
-
-        QRect itemRect = gallery->visualItemRect(item);
-
-        if (!itemRect.intersects(viewportRect))
-        {
-            continue;
-        }
 
         const int fileIndex = item->data(Qt::UserRole).toInt();
 
         if (fileIndex < 0 || fileIndex >= files.size())
-        {
             continue;
-        }
+
+        // Saltar los que ya tienen miniatura generada (persisten cacheados).
+        if (videoIconCache.contains(fileIndex) ||
+            imageIconCache.contains(fileIndex))
+            continue;
 
         thumbnailPendingIndexes.insert(fileIndex);
+        ++queued;
     }
 
     if (!thumbnailTimer->isActive())
@@ -1415,7 +1614,7 @@ void MainWindow::loadNextThumbnailBatch()
             continue;
         }
 
-        QIcon icon = realThumbnailForFile(files[fileIndex]);
+        QIcon icon = realThumbnailForFile(files[fileIndex], fileIndex);
 
         for (int i = 0; i < gallery->count(); ++i)
         {
@@ -1487,44 +1686,118 @@ QIcon MainWindow::placeholderIconForFile(
 }
 
 QIcon MainWindow::realThumbnailForFile(
-    RecoverableFile& file
+    RecoverableFile& file,
+    int fileIndex
 )
 {
     PreviewService preview;
 
-    QString path = file.currentPath;
+    const bool isImg = preview.isImage(file.extension);
+    const bool isVid = preview.isVideo(file.extension);
 
-    if (path.isEmpty() || !QFileInfo::exists(path))
+    // ── VIDEO: miniatura real (un fotograma) en segundo plano ──
+    if (isVid)
     {
-        if (file.source == RecoverySource::DeepScan)
-        {
-            path = preview.createTemporaryPreviewFile(
-                file,
-                activeScanRoot
-            );
+        // Si ya se generó, devolver la miniatura cacheada (persiste al navegar).
+        if (fileIndex >= 0 && videoIconCache.contains(fileIndex))
+            return videoIconCache.value(fileIndex);
 
-            if (!path.isEmpty())
-            {
-                file.currentPath = path;
-            }
-        }
-        else
+        // La lectura del disco y la decodificación ocurren en un hilo de fondo
+        // (VideoThumbnailer), nunca en el hilo de UI: no congela aunque se
+        // genere durante el escaneo.
+        if (videoThumbnailer &&
+            fileIndex >= 0 &&
+            !videoThumbnailRequested.contains(fileIndex) &&
+            file.source == RecoverySource::DeepScan &&
+            file.offset >= 0)
         {
-            path = file.originalPath;
+            videoThumbnailRequested.insert(fileIndex);
+            videoThumbnailer->enqueue(fileIndex, file, activeScanRoot);
         }
+
+        QPixmap videoPixmap(96, 96);
+        videoPixmap.fill(Qt::transparent);
+
+        QPainter painter(&videoPixmap);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setBrush(QColor("#111827"));
+        painter.setPen(Qt::NoPen);
+        painter.drawRoundedRect(8, 8, 80, 80, 12, 12);
+        painter.setBrush(Qt::white);
+        QPolygon playIcon;
+        playIcon << QPoint(40, 30) << QPoint(40, 66) << QPoint(68, 48);
+        painter.drawPolygon(playIcon);
+        painter.end();
+
+        return QIcon(videoPixmap);
     }
 
-    if (path.isEmpty() || !QFileInfo::exists(path))
+    // ── IMAGEN reconstruida: generar la miniatura en segundo plano ──
+    if (isImg && file.source == RecoverySource::DeepScan && file.offset >= 0)
     {
+        // Si ya se generó, devolver la miniatura cacheada (persiste al navegar).
+        if (fileIndex >= 0 && imageIconCache.contains(fileIndex))
+            return imageIconCache.value(fileIndex);
+
+        if (fileIndex >= 0 && !imageThumbnailRequested.contains(fileIndex))
+        {
+            imageThumbnailRequested.insert(fileIndex);
+
+            const RecoverableFile f = file;
+            const QString root = activeScanRoot;
+
+            auto* watcher = new QFutureWatcher<QImage>(this);
+
+            connect(
+                watcher, &QFutureWatcher<QImage>::finished,
+                this, [this, watcher, fileIndex]()
+                {
+                    const QImage img = watcher->result();
+                    watcher->deleteLater();
+
+                    if (!img.isNull())
+                        onImageThumbnailReady(fileIndex, img);
+                }
+            );
+
+            watcher->setFuture(
+                QtConcurrent::run(
+                    [f, root]() -> QImage
+                    {
+                        PreviewService preview;
+
+                        const QString path =
+                            preview.createTemporaryPreviewFile(f, root);
+
+                        if (path.isEmpty())
+                            return QImage();
+
+                        QImageReader reader(path);
+                        reader.setAutoTransform(true);
+                        reader.setScaledSize(QSize(96, 96));
+
+                        return reader.read();
+                    }
+                )
+            );
+        }
+
         return placeholderIconForFile(file);
     }
 
-    if (thumbnailCache.contains(path))
-    {
-        return thumbnailCache.value(path);
-    }
+    // ── Imagen no reconstruida (papelera/carpeta): el archivo ya existe ──
+    QString path = file.currentPath;
 
-    if (preview.isImage(file.extension))
+    if ((path.isEmpty() || !QFileInfo::exists(path)))
+        path = file.originalPath;
+
+    if (path.isEmpty() || !QFileInfo::exists(path))
+        return placeholderIconForFile(file);
+
+    if (thumbnailCache.contains(path))
+        return thumbnailCache.value(path);
+
+    if (isImg)
     {
         QImageReader reader(path);
         reader.setAutoTransform(true);
@@ -1534,41 +1807,10 @@ QIcon MainWindow::realThumbnailForFile(
 
         if (!image.isNull())
         {
-            QPixmap pixmap = QPixmap::fromImage(image);
-
-            QIcon icon(pixmap);
+            QIcon icon(QPixmap::fromImage(image));
             thumbnailCache.insert(path, icon);
-
             return icon;
         }
-    }
-
-    if (preview.isVideo(file.extension))
-    {
-        QPixmap videoPixmap(96, 96);
-        videoPixmap.fill(Qt::transparent);
-
-        QPainter painter(&videoPixmap);
-        painter.setRenderHint(QPainter::Antialiasing);
-
-        painter.setBrush(QColor("#111827"));
-        painter.setPen(Qt::NoPen);
-        painter.drawRoundedRect(8, 8, 80, 80, 12, 12);
-
-        painter.setBrush(Qt::white);
-
-        QPolygon playIcon;
-        playIcon << QPoint(40, 30)
-                 << QPoint(40, 66)
-                 << QPoint(68, 48);
-
-        painter.drawPolygon(playIcon);
-        painter.end();
-
-        QIcon icon(videoPixmap);
-        thumbnailCache.insert(path, icon);
-
-        return icon;
     }
 
     return placeholderIconForFile(file);
@@ -1608,6 +1850,44 @@ void MainWindow::showPreviewByFileIndex(int fileIndex)
 
     previewLabel->show();
     previewLabel->setAlignment(Qt::AlignCenter);
+
+    // Video: mostrar SOLO el primer fotograma (sin reproducir y sin leer
+    // cientos de MB en el hilo de UI). Si aún no se extrajo, se genera en
+    // segundo plano y onVideoThumbnailReady actualizará esta vista.
+    if (preview.isVideo(file.extension))
+    {
+        hasPersistentPreview = false;
+
+        if (videoFrameCache.contains(currentPreviewFileIndex))
+        {
+            previewLabel->clear();
+            previewLabel->setPixmap(
+                QPixmap::fromImage(videoFrameCache[currentPreviewFileIndex])
+                    .scaled(
+                        previewLabel->size(),
+                        Qt::KeepAspectRatio,
+                        Qt::SmoothTransformation
+                    )
+            );
+        }
+        else
+        {
+            previewLabel->setText("Generando vista previa del video...");
+
+            if (videoThumbnailer &&
+                file.offset >= 0 &&
+                !videoThumbnailRequested.contains(currentPreviewFileIndex))
+            {
+                videoThumbnailRequested.insert(currentPreviewFileIndex);
+                videoThumbnailer->enqueue(
+                    currentPreviewFileIndex, file, activeScanRoot
+                );
+            }
+        }
+
+        updatePreviewDetails(file);
+        return;
+    }
 
     QString previewPath = file.currentPath;
 
@@ -1699,46 +1979,48 @@ void MainWindow::updateResultsTreeCounts()
 void MainWindow::loadDrives()
 {
     if (!driveCombo)
-    {
         return;
-    }
+
+    const QString previousPath = driveCombo->currentData().toString();
 
     driveCombo->clear();
 
-    const QList<QStorageInfo> drives = QStorageInfo::mountedVolumes();
+    const QList<DriveInfo> drives = DriveScanner::getAvailableDrives();
 
-    for (const QStorageInfo& drive : drives)
+    for (const DriveInfo& drive : drives)
     {
-        if (!drive.isValid() || !drive.isReady())
-        {
+        if (!drive.isReady)
             continue;
-        }
 
-        QString rootPath = drive.rootPath();
-
-        if (rootPath.isEmpty())
-        {
-            continue;
-        }
-
-        QString label = rootPath;
-
-        if (!drive.displayName().isEmpty())
-        {
-            label += " - " + drive.displayName();
-        }
-
-        driveCombo->addItem(label, rootPath);
+        driveCombo->addItem(drive.displayLabel, drive.path);
     }
 
     if (driveCombo->count() == 0)
+        driveCombo->addItem("C:/ [Disco local]", "C:/");
+
+    if (!previousPath.isEmpty())
     {
-        driveCombo->addItem("C:/", "C:/");
+        for (int i = 0; i < driveCombo->count(); ++i)
+        {
+            if (driveCombo->itemData(i).toString() == previousPath)
+            {
+                driveCombo->setCurrentIndex(i);
+                break;
+            }
+        }
     }
 }
 
 void MainWindow::scanRecycleBin()
 {
+    // --- Diálogo de selección de tipos de archivo ---
+    {
+        FileTypeDialog dlg(this);
+        if (dlg.exec() != QDialog::Accepted)
+            return;
+        m_selectedFileCategories = dlg.selectedCategories();
+    }
+
     QString selectedDrive = driveCombo->currentData().toString();
 
     if (selectedDrive.isEmpty())
@@ -1750,7 +2032,7 @@ void MainWindow::scanRecycleBin()
     {
         QMessageBox::warning(
             this,
-            "RecoveryDisk",
+            "DemogoRecovery",
             "Selecciona una unidad primero."
         );
         return;
@@ -1831,6 +2113,14 @@ void MainWindow::scanFolder()
     if (scanThread)
         return;
 
+    // --- Diálogo de selección de tipos de archivo ---
+    {
+        FileTypeDialog dlg(this);
+        if (dlg.exec() != QDialog::Accepted)
+            return;
+        m_selectedFileCategories = dlg.selectedCategories();
+    }
+
     QString folder =
         QFileDialog::getExistingDirectory(
             this,
@@ -1846,7 +2136,7 @@ void MainWindow::scanFolder()
     {
         QMessageBox::information(
             this,
-            "RecoveryDisk",
+            "DemogoRecovery",
             "Para escanear una unidad completa utiliza Escaneo profundo."
         );
 
@@ -1931,6 +2221,14 @@ void MainWindow::deepScan()
     if (scanThread)
         return;
 
+    // --- Diálogo de selección de tipos de archivo ---
+    {
+        FileTypeDialog dlg(this);
+        if (dlg.exec() != QDialog::Accepted)
+            return;
+        m_selectedFileCategories = dlg.selectedCategories();
+    }
+
     QString selectedDrive = driveCombo->currentData().toString();
 
     if (selectedDrive.isEmpty())
@@ -1940,7 +2238,7 @@ void MainWindow::deepScan()
     {
         QMessageBox::warning(
             this,
-            "RecoveryDisk",
+            "DemogoRecovery",
             "Selecciona una unidad primero."
         );
         return;
@@ -1960,6 +2258,16 @@ void MainWindow::deepScan()
     files.clear();
     pendingScanFiles.clear();
     visibleFileIndexes.clear();
+
+    thumbnailCache.clear();
+    thumbnailPendingIndexes.clear();
+    videoThumbnailRequested.clear();
+    imageThumbnailRequested.clear();
+    videoFrameCache.clear();
+    videoIconCache.clear();
+    imageIconCache.clear();
+    if (videoThumbnailer)
+        videoThumbnailer->clearQueue();
 
     loadedVisibleRows = 0;
     currentPreviewFileIndex = -1;
@@ -2114,7 +2422,7 @@ void MainWindow::deepScan()
 
             QMessageBox::critical(
                 this,
-                "RecoveryDisk",
+                "DemogoRecovery",
                 error
             );
 
@@ -2151,6 +2459,14 @@ void MainWindow::deepScan()
         {
             scanThread = nullptr;
             scanWorker = nullptr;
+
+            // El escaneo terminó: refrescar miniaturas de los items visibles.
+            if (viewModeCombo && viewModeCombo->currentIndex() == 1)
+            {
+                QTimer::singleShot(
+                    150, this, &MainWindow::requestVisibleThumbnails
+                );
+            }
         }
     );
 
@@ -2207,7 +2523,8 @@ void MainWindow::recoverSelectedFiles()
     RecoveryResult result =
         service.recoverFiles(
             selected,
-            destination
+            destination,
+            activeScanRoot
         );
 
     QString message =
@@ -2229,7 +2546,7 @@ void MainWindow::recoverSelectedFiles()
     {
         QMessageBox::information(
             this,
-            "RecoveryDisk",
+            "DemogoRecovery",
             message
         );
     }
@@ -2237,7 +2554,7 @@ void MainWindow::recoverSelectedFiles()
     {
         QMessageBox::warning(
             this,
-            "RecoveryDisk",
+            "DemogoRecovery",
             message
         );
     }
@@ -2384,6 +2701,16 @@ void MainWindow::applyFilters()
     );
 
     updateSelectedCount();
+
+    // Solicitar las miniaturas de los items recién mostrados (si estamos en
+    // la vista de miniaturas). Un pequeño retardo deja que la galería calcule
+    // su layout antes de generar las miniaturas.
+    if (viewModeCombo && viewModeCombo->currentIndex() == 1)
+    {
+        QTimer::singleShot(
+            50, this, &MainWindow::requestVisibleThumbnails
+        );
+    }
 }
 
 void MainWindow::updateSummary()
@@ -2461,6 +2788,32 @@ bool MainWindow::matchesCurrentFilters(
         return false;
     }
 
+    // Filtro por tipos seleccionados en el diálogo previo al escaneo.
+    // "system" no tiene categoría propia en el árbol; lo mapeamos a "others"
+    // para el propósito de este filtro.
+    if (!m_selectedFileCategories.isEmpty())
+    {
+        const QString cat = categoryKeyForFile(file);
+
+        // Si el usuario seleccionó "system" lo tratamos igual que "others"
+        bool allowed = m_selectedFileCategories.contains(cat);
+
+        if (!allowed && cat == "others")
+            allowed = m_selectedFileCategories.contains("system");
+
+        if (!allowed)
+            return false;
+    }
+
+    // Filtro por scope del árbol (Reconstruido vs originales)
+    if (currentTreeScope == "reconstructed" && !file.reconstructed) {
+        return false;
+    }
+
+    if (currentTreeScope == "original" && file.reconstructed) {
+        return false;
+    }
+
     if (currentTreeCategoryKey == "all") {
         return true;
     }
@@ -2507,6 +2860,44 @@ void MainWindow::showPreview(int row)
 
     previewLabel->show();
     previewLabel->setAlignment(Qt::AlignCenter);
+
+    // Video: mostrar SOLO el primer fotograma (sin reproducir y sin leer
+    // cientos de MB en el hilo de UI). Si aún no se extrajo, se genera en
+    // segundo plano y onVideoThumbnailReady actualizará esta vista.
+    if (preview.isVideo(file.extension))
+    {
+        hasPersistentPreview = false;
+
+        if (videoFrameCache.contains(currentPreviewFileIndex))
+        {
+            previewLabel->clear();
+            previewLabel->setPixmap(
+                QPixmap::fromImage(videoFrameCache[currentPreviewFileIndex])
+                    .scaled(
+                        previewLabel->size(),
+                        Qt::KeepAspectRatio,
+                        Qt::SmoothTransformation
+                    )
+            );
+        }
+        else
+        {
+            previewLabel->setText("Generando vista previa del video...");
+
+            if (videoThumbnailer &&
+                file.offset >= 0 &&
+                !videoThumbnailRequested.contains(currentPreviewFileIndex))
+            {
+                videoThumbnailRequested.insert(currentPreviewFileIndex);
+                videoThumbnailer->enqueue(
+                    currentPreviewFileIndex, file, activeScanRoot
+                );
+            }
+        }
+
+        updatePreviewDetails(file);
+        return;
+    }
 
     QString previewPath = file.currentPath;
 
@@ -2878,22 +3269,31 @@ void MainWindow::flushPendingScanFiles()
     updateSummary();
     updateSelectedCount();
 
-    if (previewStatusLabel)
+    progressBar->setValue(100);
+
+    if (scanWasCancelled)
     {
-        previewStatusLabel->setText(
-            QString("Escaneo cancelado. Archivos encontrados: %1")
-                .arg(files.size())
-        );
+        scanStatusLabel->setText("Estado: Cancelado");
+
+        if (previewStatusLabel)
+        {
+            previewStatusLabel->setText(
+                QString("Escaneo cancelado. Archivos encontrados: %1")
+                    .arg(files.size())
+            );
+        }
     }
     else
     {
-        progressBar->setValue(100);
         scanStatusLabel->setText("Estado: Finalizado");
 
-        previewLabel->setText(
-            QString("Escaneo finalizado. Archivos encontrados: %1")
-                .arg(files.size())
-        );
+        if (previewStatusLabel)
+        {
+            previewStatusLabel->setText(
+                QString("Escaneo finalizado. Archivos encontrados: %1")
+                    .arg(files.size())
+            );
+        }
     }
 
     foundCountLabel->setText(
@@ -2922,9 +3322,11 @@ void MainWindow::onTreeItemClicked(QTreeWidgetItem* item, int column)
 
     currentTreeCategoryKey.clear();
     currentTreeExtension.clear();
+    currentTreeScope.clear();
 
     QVariant categoryData = item->data(0, Qt::UserRole);
     QVariant extensionData = item->data(0, Qt::UserRole + 1);
+    QVariant scopeData = item->data(0, Qt::UserRole + 2);
 
     if (categoryData.isValid()) {
         currentTreeCategoryKey = categoryData.toString();
@@ -2932,6 +3334,10 @@ void MainWindow::onTreeItemClicked(QTreeWidgetItem* item, int column)
 
     if (extensionData.isValid()) {
         currentTreeExtension = extensionData.toString();
+    }
+
+    if (scopeData.isValid()) {
+        currentTreeScope = scopeData.toString();
     }
 
     if (currentTreeCategoryKey.isEmpty()) {

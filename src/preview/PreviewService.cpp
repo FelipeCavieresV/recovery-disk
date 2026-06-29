@@ -5,6 +5,11 @@
 #include <QStandardPaths>
 #include <QFileInfo>
 
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <winioctl.h>
+#endif
+
 bool PreviewService::isImage(const QString& extension) const
 {
     QString ext = extension.toLower();
@@ -14,7 +19,9 @@ bool PreviewService::isImage(const QString& extension) const
            ext == "png" ||
            ext == "bmp" ||
            ext == "gif" ||
-           ext == "webp";
+           ext == "webp" ||
+           ext == "tif" ||
+           ext == "tiff";
 }
 
 bool PreviewService::isVideo(const QString& extension) const
@@ -22,11 +29,17 @@ bool PreviewService::isVideo(const QString& extension) const
     QString ext = extension.toLower();
 
     return ext == "mp4" ||
+           ext == "m4v" ||
            ext == "mov" ||
            ext == "avi" ||
            ext == "mkv" ||
            ext == "wmv" ||
-           ext == "webm";
+           ext == "webm" ||
+           ext == "flv" ||
+           ext == "mpg" ||
+           ext == "mpeg" ||
+           ext == "3gp" ||
+           ext == "swf";
 }
 
 QPixmap PreviewService::createImagePreview(
@@ -70,7 +83,8 @@ QString PreviewService::normalizeDevicePath(
 
 QString PreviewService::createTemporaryPreviewFile(
     const RecoverableFile& file,
-    const QString& driveRoot
+    const QString& driveRoot,
+    qint64 maxBytes
 ) const
 {
     if (file.offset < 0)
@@ -93,7 +107,26 @@ QString PreviewService::createTemporaryPreviewFile(
 
     QByteArray data;
 
-    if (
+    // Archivos reconstruidos desde la tabla del sistema de archivos: conocemos
+    // el offset y el tamaño exactos. Leemos alineado a sector (Windows exige
+    // lecturas de volumen crudo con tamaño múltiplo del sector) y recortamos.
+    // 'maxBytes' (si > 0) limita la lectura — útil para miniaturas de video,
+    // donde basta el inicio del archivo para extraer un fotograma.
+    if (file.reconstructed && file.size > 0)
+    {
+        const qint64 S = 512;
+        qint64 want = qMin<qint64>(file.size, 300LL * 1024 * 1024);
+
+        if (maxBytes > 0)
+            want = qMin(want, maxBytes);
+        const qint64 toRead = ((want + S - 1) / S) * S;
+
+        data = drive.read(toRead);
+
+        if (data.size() > want)
+            data.truncate(static_cast<int>(want));
+    }
+    else if (
         ext == "jpg" ||
         ext == "jpeg"
     )
@@ -186,7 +219,7 @@ QString PreviewService::createTemporaryPreviewFile(
     QString tempDir =
         QStandardPaths::writableLocation(
             QStandardPaths::TempLocation
-        ) + "/RecoveryDiskPreview";
+        ) + "/DemogoRecoveryPreview";
 
     QDir().mkpath(tempDir);
 
@@ -205,4 +238,147 @@ QString PreviewService::createTemporaryPreviewFile(
     output.close();
 
     return tempPath;
+}
+
+QString PreviewService::createVideoPreviewFile(
+    const RecoverableFile& file,
+    const QString& driveRoot
+) const
+{
+    if (file.offset < 0 || file.size <= 0)
+        return "";
+
+    const QString devicePath = normalizeDevicePath(driveRoot);
+
+    QFile drive(devicePath);
+
+    if (!drive.open(QIODevice::ReadOnly))
+        return "";
+
+    const qint64 S = 512;
+    const qint64 size = file.size;
+
+    // Inicio del archivo (ftyp + primeros fotogramas del mdat).
+    const qint64 headWant = qMin<qint64>(size, 24LL * 1024 * 1024);
+    const qint64 headRead = ((headWant + S - 1) / S) * S;
+
+    if (!drive.seek(file.offset))
+    {
+        drive.close();
+        return "";
+    }
+
+    QByteArray head = drive.read(headRead);
+
+    if (head.size() > headWant)
+        head.truncate(static_cast<int>(headWant));
+
+    // Final del archivo (donde suele estar el índice 'moov' de los MP4/MOV).
+    QByteArray tail;
+    qint64 tailOffsetInFile = 0;
+
+    if (size > headWant)
+    {
+        const qint64 tailWant =
+            qMin<qint64>(size - headWant, 24LL * 1024 * 1024);
+
+        const qint64 tailStart = file.offset + size - tailWant;
+        const qint64 tailStartAligned = (tailStart / S) * S;
+        const qint64 delta = tailStart - tailStartAligned;
+        const qint64 tailRead = ((tailWant + delta + S - 1) / S) * S;
+
+        if (drive.seek(tailStartAligned))
+        {
+            QByteArray raw = drive.read(tailRead);
+
+            if (raw.size() > delta)
+            {
+                tail = raw.mid(
+                    static_cast<int>(delta),
+                    static_cast<int>(
+                        qMin<qint64>(tailWant, raw.size() - delta)
+                    )
+                );
+                tailOffsetInFile = size - tail.size();
+            }
+        }
+    }
+
+    drive.close();
+
+    if (head.isEmpty())
+        return "";
+
+    QString tempDir =
+        QStandardPaths::writableLocation(QStandardPaths::TempLocation) +
+        "/DemogoRecoveryPreview";
+
+    QDir().mkpath(tempDir);
+
+    const QString tempPath =
+        tempDir + "/" +
+        QString("vthumb_%1.%2")
+            .arg(file.offset)
+            .arg(file.extension.toLower());
+
+#ifdef Q_OS_WIN
+    // Archivo sparse: solo el inicio y el final ocupan espacio en disco; el
+    // hueco intermedio se lee como ceros sin escribirlo físicamente.
+    HANDLE h = CreateFileW(
+        reinterpret_cast<LPCWSTR>(tempPath.utf16()),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (h == INVALID_HANDLE_VALUE)
+        return "";
+
+    DWORD br = 0;
+    DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &br, nullptr);
+
+    LARGE_INTEGER li;
+    li.QuadPart = size;
+    SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
+    SetEndOfFile(h);
+
+    LARGE_INTEGER zero;
+    zero.QuadPart = 0;
+    SetFilePointerEx(h, zero, nullptr, FILE_BEGIN);
+
+    DWORD written = 0;
+    WriteFile(h, head.constData(), static_cast<DWORD>(head.size()), &written, nullptr);
+
+    if (!tail.isEmpty())
+    {
+        LARGE_INTEGER tp;
+        tp.QuadPart = tailOffsetInFile;
+        SetFilePointerEx(h, tp, nullptr, FILE_BEGIN);
+        WriteFile(h, tail.constData(), static_cast<DWORD>(tail.size()), &written, nullptr);
+    }
+
+    CloseHandle(h);
+    return tempPath;
+#else
+    QFile output(tempPath);
+
+    if (!output.open(QIODevice::WriteOnly))
+        return "";
+
+    output.resize(size);
+    output.seek(0);
+    output.write(head);
+
+    if (!tail.isEmpty())
+    {
+        output.seek(tailOffsetInFile);
+        output.write(tail);
+    }
+
+    output.close();
+    return tempPath;
+#endif
 }

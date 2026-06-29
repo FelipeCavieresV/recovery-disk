@@ -2,6 +2,7 @@
 
 #include "signatures/SignatureDatabase.h"
 #include "signatures/SignatureScanner.h"
+#include "filesystem/FatRecovery.h"
 
 #include <QFile>
 #include <QDebug>
@@ -126,6 +127,36 @@ QVector<RecoverableFile> DeepDiskScanner::scanDrive(
 
     const QString devicePath = normalizeDrivePath(driveLetter);
 
+    // ── Paso 1: intentar recuperación por tabla del sistema de archivos ──
+    // Es lo que permite reconstruir archivos con su nombre/ruta/fecha reales
+    // (igual que la sección "Reconstruido" de 4DDiG). Si el volumen no es FAT,
+    // caemos al carving por firmas.
+    {
+        FatRecovery fatRecovery;
+        QString fatError;
+
+        QVector<RecoverableFile> fatResults =
+            fatRecovery.recover(
+                devicePath,
+                onProgress,
+                onBatch,
+                isCancelled,
+                &fatError
+            );
+
+        const bool notFat = (fatError == "__NOT_FAT__");
+
+        if (!notFat)
+        {
+            // Era un volumen FAT: devolvemos lo reconstruido (aunque esté vacío).
+            if (!fatError.isEmpty() && errorMessage)
+                *errorMessage = fatError;
+
+            return fatResults;
+        }
+        // Si no es FAT, continuamos con el carving por firmas más abajo.
+    }
+
     QFile drive(devicePath);
 
     if (!drive.open(QIODevice::ReadOnly))
@@ -135,7 +166,7 @@ QVector<RecoverableFile> DeepDiskScanner::scanDrive(
             *errorMessage =
                 "No se pudo abrir la unidad:\n" +
                 devicePath +
-                "\n\nEjecuta RecoveryDisk como administrador.";
+                "\n\nEjecuta DemogoRecovery como administrador.";
         }
 
         return results;

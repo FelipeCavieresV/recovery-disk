@@ -23,7 +23,8 @@ class FileRecoveryService
 public:
     RecoveryResult recoverFiles(
         const QVector<RecoverableFile>& files,
-        const QString& destinationFolder
+        const QString& destinationFolder,
+        const QString& driveRoot = QString()
     );
 
 private:
@@ -41,6 +42,15 @@ private:
         QString& outputPath,
         QString& error
     ) const;
+
+    bool extractFromDisk(
+        const RecoverableFile& file,
+        const QString& driveRoot,
+        const QString& outputPath,
+        QString& error
+    ) const;
+
+    QString normalizeDrivePath(const QString& driveRoot) const;
 
     QString createReport(
         const RecoveryResult& result

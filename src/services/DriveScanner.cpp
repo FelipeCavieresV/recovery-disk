@@ -47,13 +47,62 @@ QList<DriveInfo> DriveScanner::getAvailableDrives()
             &totalFreeBytes
         );
 
+        UINT winDriveType = GetDriveTypeW(
+            reinterpret_cast<LPCWSTR>(rootPath.utf16())
+        );
+
+        DriveType driveType = DriveType::Unknown;
+        QString typeLabel;
+
+        switch (winDriveType)
+        {
+            case DRIVE_FIXED:
+                driveType = DriveType::Fixed;
+                typeLabel = "Disco local";
+                break;
+            case DRIVE_REMOVABLE:
+                driveType = DriveType::Removable;
+                typeLabel = "USB";
+                break;
+            case DRIVE_REMOTE:
+                driveType = DriveType::Network;
+                typeLabel = "Red";
+                break;
+            case DRIVE_CDROM:
+                driveType = DriveType::CdRom;
+                typeLabel = "CD/DVD";
+                break;
+            case DRIVE_RAMDISK:
+                driveType = DriveType::Ram;
+                typeLabel = "RAM";
+                break;
+            default:
+                typeLabel = "Desconocido";
+                break;
+        }
+
+        QString volumeLabel = volumeOk
+            ? QString::fromWCharArray(volumeName)
+            : QString();
+
+        QString displayLabel =
+            QString("%1: [%2]").arg(letter).arg(typeLabel);
+
+        if (!volumeLabel.isEmpty())
+            displayLabel += " " + volumeLabel;
+
+        if (spaceOk)
+            displayLabel += " (" + formatBytes(totalBytes.QuadPart) + ")";
+
         DriveInfo info;
         info.path = rootPath;
         info.name = QString("%1:").arg(letter);
+        info.displayLabel = displayLabel;
         info.fileSystem = volumeOk ? QString::fromWCharArray(fileSystemName) : "Desconocido";
         info.totalBytes = spaceOk ? static_cast<qint64>(totalBytes.QuadPart) : 0;
         info.freeBytes = spaceOk ? static_cast<qint64>(totalFreeBytes.QuadPart) : 0;
-        info.isReady = volumeOk && spaceOk;
+        info.isReady = (winDriveType != DRIVE_NO_ROOT_DIR) && volumeOk;
+        info.driveType = driveType;
 
         drives.append(info);
     }

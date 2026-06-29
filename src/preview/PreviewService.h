@@ -19,6 +19,16 @@ public:
 
     QString createTemporaryPreviewFile(
         const RecoverableFile& file,
+        const QString& driveRoot,
+        qint64 maxBytes = 0
+    ) const;
+
+    // Crea un archivo temporal para extraer una miniatura de video leyendo solo
+    // el inicio (primer fotograma) y el final (índice 'moov') del archivo, con
+    // el tamaño total correcto y ceros en el medio. Permite decodificar un
+    // fotograma de MP4/MOV cuyo 'moov' está al final, sin leer todo el video.
+    QString createVideoPreviewFile(
+        const RecoverableFile& file,
         const QString& driveRoot
     ) const;
 

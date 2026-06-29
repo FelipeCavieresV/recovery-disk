@@ -36,6 +36,12 @@ struct RecoverableFile
     qint64 offset = -1;
     bool hasValidHeader = false;
     bool hasValidFooter = false;
+
+    // Recuperación basada en la tabla del sistema de archivos (FAT/NTFS):
+    // estos archivos conservan su nombre, ruta y fecha originales.
+    bool reconstructed = false;
+    bool isDeleted = false;
+    QString folderPath;   // ruta de la carpeta dentro del volumen
 };
 
 Q_DECLARE_METATYPE(RecoverableFile)

@@ -1,15 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(RecoveryDisk LANGUAGES CXX)
+project(DemogoRecovery LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets Concurrent)
 
 qt_standard_project_setup()
 
-qt_add_executable(RecoveryDisk
+qt_add_executable(DemogoRecovery
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp
 
     ${CMAKE_CURRENT_SOURCE_DIR}/src/models/RecoverableFile.h
@@ -19,6 +19,9 @@ qt_add_executable(RecoveryDisk
 
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ui/MainWindow.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ui/MainWindow.cpp
+
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ui/FileTypeDialog.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ui/FileTypeDialog.cpp
 
     ${CMAKE_CURRENT_SOURCE_DIR}/src/services/DriveScanner.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/services/DriveScanner.cpp
@@ -51,16 +54,23 @@ qt_add_executable(RecoveryDisk
 
     ${CMAKE_CURRENT_SOURCE_DIR}/src/preview/PreviewService.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/preview/PreviewService.cpp
+
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/preview/VideoThumbnailer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/preview/VideoThumbnailer.cpp
+
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/filesystem/FatRecovery.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/filesystem/FatRecovery.cpp
 )
 
-target_include_directories(RecoveryDisk
+target_include_directories(DemogoRecovery
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-target_link_libraries(RecoveryDisk
+target_link_libraries(DemogoRecovery
     PRIVATE
     Qt6::Widgets
     Qt6::Multimedia
     Qt6::MultimediaWidgets
+    Qt6::Concurrent
 )

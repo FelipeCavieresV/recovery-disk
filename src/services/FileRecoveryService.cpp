@@ -8,7 +8,8 @@
 
 RecoveryResult FileRecoveryService::recoverFiles(
     const QVector<RecoverableFile>& files,
-    const QString& destinationFolder
+    const QString& destinationFolder,
+    const QString& driveRoot
 )
 {
     RecoveryResult result;
@@ -23,17 +24,58 @@ RecoveryResult FileRecoveryService::recoverFiles(
         QString outputPath;
         QString error;
 
-        if (copySingleFile(file, result.outputFolder, outputPath, error))
+        bool ok = false;
+
+        if (file.source == RecoverySource::DeepScan && !driveRoot.isEmpty())
         {
-            result.recovered++;
-            result.recoveredFiles.push_back(outputPath);
+            QString baseName = safeFileName(file.originalName);
+            outputPath = QDir(result.outputFolder).filePath(baseName);
+
+            QFileInfo outputInfo(outputPath);
+            int counter = 1;
+
+            while (outputInfo.exists())
+            {
+                QString stem = outputInfo.completeBaseName();
+                QString suffix = outputInfo.suffix();
+                QString newName = suffix.isEmpty()
+                    ? QString("%1_%2").arg(stem).arg(counter)
+                    : QString("%1_%2.%3").arg(stem).arg(counter).arg(suffix);
+                outputPath = QDir(result.outputFolder).filePath(newName);
+                outputInfo = QFileInfo(outputPath);
+                counter++;
+            }
+
+            if (!file.currentPath.isEmpty() && QFileInfo::exists(file.currentPath))
+                ok = QFile::copy(file.currentPath, outputPath);
+            else
+                ok = extractFromDisk(file, driveRoot, outputPath, error);
+
+            if (ok)
+            {
+                result.recovered++;
+                result.recoveredFiles.push_back(outputPath);
+            }
+            else
+            {
+                result.failed++;
+                result.failedFiles.push_back(file.originalName + " | " + error);
+            }
         }
         else
         {
-            result.failed++;
-            result.failedFiles.push_back(
-                file.originalName + " | " + error
-            );
+            ok = copySingleFile(file, result.outputFolder, outputPath, error);
+
+            if (ok)
+            {
+                result.recovered++;
+                result.recoveredFiles.push_back(outputPath);
+            }
+            else
+            {
+                result.failed++;
+                result.failedFiles.push_back(file.originalName + " | " + error);
+            }
         }
     }
 
@@ -50,7 +92,7 @@ QString FileRecoveryService::createRecoveryFolder(
         QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
 
     return QDir(destinationFolder).filePath(
-        "RecoveryDisk_Recovered_" + timestamp
+        "DemogoRecovery_Recovered_" + timestamp
     );
 }
 
@@ -157,7 +199,7 @@ QString FileRecoveryService::createReport(
 
     QTextStream out(&report);
 
-    out << "RecoveryDisk - Reporte de recuperación\n";
+    out << "DemogoRecovery - Reporte de recuperación\n";
     out << "Fecha: "
         << QDateTime::currentDateTime().toString("dd/MM/yyyy HH:mm:ss")
         << "\n\n";
@@ -180,4 +222,122 @@ QString FileRecoveryService::createReport(
     report.close();
 
     return reportPath;
+}
+
+QString FileRecoveryService::normalizeDrivePath(const QString& driveRoot) const
+{
+    QString drive = driveRoot.trimmed();
+    drive.replace("/", "\\");
+
+    if (drive.startsWith("\\\\.\\"))
+        return drive;
+
+    if (drive.endsWith("\\"))
+        drive.chop(1);
+
+    if (drive.endsWith(":"))
+        return "\\\\.\\" + drive.toUpper();
+
+    if (drive.length() == 1)
+        return "\\\\.\\" + drive.toUpper() + ":";
+
+    return drive;
+}
+
+bool FileRecoveryService::extractFromDisk(
+    const RecoverableFile& file,
+    const QString& driveRoot,
+    const QString& outputPath,
+    QString& error
+) const
+{
+    if (file.offset < 0)
+    {
+        error = "Offset inválido";
+        return false;
+    }
+
+    const QString devicePath = normalizeDrivePath(driveRoot);
+
+    QFile drive(devicePath);
+
+    if (!drive.open(QIODevice::ReadOnly))
+    {
+        error = "No se pudo abrir la unidad (ejecuta como administrador)";
+        return false;
+    }
+
+    if (!drive.seek(file.offset))
+    {
+        drive.close();
+        error = "No se pudo buscar el offset en la unidad";
+        return false;
+    }
+
+    // Tamaño total a extraer. Para archivos reconstruidos conocemos el tamaño
+    // exacto; si no, usamos un valor por defecto moderado.
+    const qint64 totalBytes = file.size > 0
+        ? file.size
+        : 50LL * 1024 * 1024;
+
+    QFile out(outputPath);
+
+    if (!out.open(QIODevice::WriteOnly))
+    {
+        drive.close();
+        error = "No se pudo crear el archivo de salida";
+        return false;
+    }
+
+    // Copia en streaming por bloques alineados a sector (Windows exige lecturas
+    // de volumen crudo con tamaño múltiplo del sector). Escribimos exactamente
+    // el tamaño del archivo. No carga todo en memoria: sirve para videos de GB.
+    const qint64 S = 512;
+    const qint64 chunkSize = 4LL * 1024 * 1024;  // múltiplo del sector
+
+    qint64 remaining = totalBytes;
+    qint64 pos = file.offset;
+    qint64 written = 0;
+
+    while (remaining > 0)
+    {
+        const qint64 want = qMin(chunkSize, remaining);
+        const qint64 toRead = ((want + S - 1) / S) * S;  // alinear hacia arriba
+
+        if (!drive.seek(pos))
+            break;
+
+        QByteArray chunk = drive.read(toRead);
+
+        if (chunk.isEmpty())
+            break;  // fin del dispositivo
+
+        const qint64 writeLen = qMin<qint64>(chunk.size(), remaining);
+
+        const qint64 w = out.write(chunk.constData(), writeLen);
+
+        if (w < 0)
+        {
+            out.close();
+            drive.close();
+            error = "Error al escribir el archivo de salida";
+            return false;
+        }
+
+        written += w;
+        remaining -= writeLen;
+        pos += chunk.size();
+    }
+
+    out.close();
+    drive.close();
+
+    if (written <= 0)
+    {
+        error = "No se pudieron leer datos del disco";
+        QFile::remove(outputPath);
+        return false;
+    }
+
+    return true;
 }

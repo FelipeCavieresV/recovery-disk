@@ -3,6 +3,7 @@
 #include <QMainWindow>
 #include <QWidget>
 #include <QStackedWidget>
+#include <QSet>
 
 #include <QTableWidget>
 #include <QTreeWidget>
@@ -19,6 +20,8 @@
 #include <QThread>
 #include <QPixmap>
 #include <QIcon>
+#include <QImage>
+#include <QHash>
 
 #include <QMediaPlayer>
 #include <QVideoWidget>
@@ -38,6 +41,8 @@ public:
 
 private slots:
     void onTreeItemClicked(QTreeWidgetItem* item, int column);
+    void onVideoThumbnailReady(int fileIndex, const QImage& image);
+    void onImageThumbnailReady(int fileIndex, const QImage& image);
 
 private:
     QStackedWidget* pages = nullptr;
@@ -62,11 +67,26 @@ private:
     QHash<QString, QIcon> thumbnailCache;
     QSet<int> thumbnailPendingIndexes;
 
+    class VideoThumbnailer* videoThumbnailer = nullptr;
+    QSet<int> videoThumbnailRequested;
+    QSet<int> imageThumbnailRequested;
+
+    // Primer fotograma (tamaño completo) de cada video, por índice de archivo.
+    // Se usa tanto en la miniatura como en la vista previa (sin reproducir).
+    QHash<int, QImage> videoFrameCache;
+
+    // Miniaturas ya generadas, por índice de archivo. Persisten al cambiar de
+    // categoría en el árbol (la galería se reconstruye pero se reaplican).
+    QHash<int, QIcon> videoIconCache;
+    QHash<int, QIcon> imageIconCache;
+
+    QIcon makeVideoThumbnailIcon(const QImage& frame) const;
+
     void setupThumbnailLoader();
     void requestVisibleThumbnails();
     void loadNextThumbnailBatch();
     QIcon placeholderIconForFile(const RecoverableFile& file) const;
-    QIcon realThumbnailForFile(RecoverableFile& file);
+    QIcon realThumbnailForFile(RecoverableFile& file, int fileIndex = -1);
     /*
      * Vista de resultados:
      * - resultsViews permite cambiar entre lista y miniaturas.
@@ -121,6 +141,7 @@ private:
     QString activeScanRoot;
     QString currentTreeCategoryKey = "all";
     QString currentTreeExtension;
+    QString currentTreeScope;   // "" = todo, "reconstructed", "original"
 
     int currentPreviewFileIndex = -1;
 
@@ -134,6 +155,10 @@ private:
 
     bool scanCompletionPending = false;
     bool scanWasCancelled = false;
+
+    // Categorías de archivo seleccionadas en el diálogo previo al escaneo.
+    // Si está vacío se muestran todas.
+    QSet<QString> m_selectedFileCategories;
 
     QTimer* treeUpdateTimer = nullptr;
 

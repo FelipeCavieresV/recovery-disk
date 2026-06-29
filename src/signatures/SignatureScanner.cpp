@@ -46,6 +46,21 @@ QVector<RecoverableFile> SignatureScanner::scanBuffer(
             if (position < 0)
                 break;
 
+            // Verificar subHeader si está definido
+            if (!signature.subHeader.isEmpty())
+            {
+                int subPos = position + signature.subHeaderOffset;
+
+                if (
+                    subPos + signature.subHeader.size() > buffer.size() ||
+                    buffer.mid(subPos, signature.subHeader.size()) != signature.subHeader
+                )
+                {
+                    position += qMax(1, signature.header.size());
+                    continue;
+                }
+            }
+
             qint64 fileOffset =
                 absoluteOffset + position;
 
